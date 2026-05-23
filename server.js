@@ -1,30 +1,23 @@
 import express from 'express';
 import cors from 'cors';
 import { MercadoPagoConfig, Payment } from 'mercadopago';
-import admin from 'firebase-admin';
+import axios from 'axios'; // Usaremos o axios para atualizar o Firebase sem travar o boot
 
 const server = express();
 server.use(express.json());
 server.use(cors());
-
-// 🔑 CONFIGURAÇÃO DO FIREBASE ADMIN (Para o servidor poder alterar o saldo)
-// Como o Firebase já está configurado no seu app, usamos a URL do seu Banco de Dados
-if (!admin.apps.length) {
-    admin.initializeApp({
-        credential: admin.credential.applicationDefault(), // O Render lê as credenciais automaticamente se configurado, ou você pode usar o fluxo padrão do Realtime
-        databaseURL: "https://azar-c7f24-default-rtdb.firebaseio.com"
-    });
-}
-const db = admin.database();
 
 // 🔑 SEU ACCESS TOKEN FIXO
 const TOKEN_MERCADO_PAGO = 'APP_USR-4600187372479747-052312-f671609e2fc63fac76626413c52cde70-1258641529';
 const client = new MercadoPagoConfig({ accessToken: TOKEN_MERCADO_PAGO });
 const payment = new Payment(client);
 
-// Rota de teste
+// URL Base do seu Firebase Realtime Database
+const FIREBASE_DB_URL = "https://azar-c7f24-default-rtdb.firebaseio.com";
+
+// Rota de teste para checar estabilidade
 server.get('/', (req, res) => {
-    res.send('Servidor do Bingo com Webhook Ativo!');
+    res.send('Servidor do Bingo Online e Blindado!');
 });
 
 // 1. ROTA QUE CRIA O PIX
@@ -43,7 +36,7 @@ server.post('/criar-pix', async (req, res) => {
                 payment_method_id: 'pix',
                 payer: { email: email || 'usuario@bingo.com' },
                 metadata: { 
-                    user_id: uid // Guardamos o ID do usuário aqui para saber quem pagou depois
+                    user_id: uid 
                 }
             }
         });
@@ -57,46 +50,44 @@ server.post('/criar-pix', async (req, res) => {
     }
 });
 
-// 2. 🚨 NOVA ROTA: WEBHOOK (O Mercado Pago avisa aqui quando o Pix for pago)
+// 2. ROTA DE WEBHOOK (Processa o aviso de pagamento do Mercado Pago e injeta no Firebase)
 server.post('/webhook', async (req, res) => {
     const { action, data } = req.body;
 
-    // Se o aviso for de um pagamento realizado
     if (action === "payment.created" || req.query.type === "payment" || action === "payment.updated") {
         const idPagamento = data?.id || req.body?.data?.id;
 
         if (idPagamento) {
             try {
-                // Consulta o Mercado Pago para ver o status real desse pagamento
                 const p = await payment.get({ id: idPagamento });
                 
-                // Se o status for "approved" (pago com sucesso!)
                 if (p.status === "approved") {
                     const uidUsuario = p.metadata?.user_id;
                     const valorPago = parseFloat(p.transaction_amount);
 
                     if (uidUsuario && valorPago > 0) {
-                        const userRef = db.ref(`users/${uidUsuario}`);
+                        // Faz uma chamada REST direta no Firebase para buscar os créditos atuais do jogador
+                        const userUrl = `${FIREBASE_DB_URL}/users/${uidUsuario}.json`;
+                        const userSnap = await axios.get(userUrl);
                         
-                        // Busca o saldo atual do cara e soma o novo valor
-                        await userRef.transaction((currentData) => {
-                            if (currentData) {
-                                let saldoAtual = parseFloat(currentData.creditos) || 0;
-                                currentData.creditos = saldoAtual + valorPago;
-                            }
-                            return currentData;
-                        });
+                        let creditosAtuais = 0;
+                        if (userSnap.data && userSnap.data.creditos) {
+                            creditosAtuais = parseFloat(userSnap.data.creditos) || 0;
+                        }
 
-                        console.log(`✅ Saldo adicionado: R$ ${valorPago} para o usuário ${uidUsuario}`);
+                        // Soma o novo valor pago e atualiza o Firebase instantaneamente via PATCH
+                        const novoSaldo = creditosAtuais + valorPago;
+                        await axios.patch(userUrl, { creditos: novoSaldo });
+
+                        console.log(`✅ Sucesso! R$ ${valorPago} adicionados à conta do ID: ${uidUsuario}`);
                     }
                 }
             } catch (err) {
-                console.error("Erro ao processar webhook:", err.message);
+                console.error("Erro no processamento interno do webhook:", err.message);
             }
         }
     }
 
-    // O Mercado Pago exige que a gente responda com status 200 para ele não ficar reenviando o aviso
     return res.status(200).send('OK');
 });
 
